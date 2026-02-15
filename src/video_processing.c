@@ -5,8 +5,14 @@
 #include <time.h>
 #include <signal.h>
 #include <unistd.h>
+#include <math.h>
 
 extern volatile sig_atomic_t keep_running;
+
+// Используем свои константы, не конфликтующие с app_state.h
+#define SYNC_THRESHOLD 0.04      // 40ms - порог для коррекции
+#define SYNC_MAX_CORRECTION 0.1  // 100ms - максимальная коррекция за раз
+#define AUDIO_START_DELAY 0.15   // 150ms - буфер для аудио
 
 static double get_current_time() {
     struct timespec ts;
@@ -21,23 +27,90 @@ static double get_frame_delay(VideoState* video) {
     return 1.0 / 30.0;
 }
 
+// Получение PTS кадра
+double video_get_pts(VideoState* video, AVFrame* frame) {
+    double pts = 0;
+    if (frame && frame->pts != AV_NOPTS_VALUE) {
+        if (video->format_ctx && video->video_stream_index >= 0) {
+            AVRational time_base = video->format_ctx->streams[video->video_stream_index]->time_base;
+            pts = frame->pts * av_q2d(time_base);
+        }
+    }
+    return pts;
+}
+
+// Улучшенная синхронизация видео с аудио
+double video_sync_adjust(VideoState* video, double pts) {
+    double frame_delay = get_frame_delay(video);
+    
+    if (!video->audio_state.initialized || !video->audio_state.playing) {
+        video->skip_next_frame = 0;
+        video->repeat_frame = 0;
+        return frame_delay;
+    }
+    
+    double audio_time = get_audio_time(&video->audio_state);
+    
+    // Добавляем небольшой буфер для аудио в начале
+    if (video->frame_count < 30) {
+        audio_time += AUDIO_START_DELAY;
+    }
+    
+    double diff = pts - audio_time;
+    video->av_diff = diff;
+    
+    // Сбрасываем флаги по умолчанию
+    video->skip_next_frame = 0;
+    video->repeat_frame = 0;
+    
+    // Динамическая коррекция
+    if (fabs(diff) > SYNC_THRESHOLD) {
+        double correction = fmin(fabs(diff) * 0.3, SYNC_MAX_CORRECTION);
+        
+        if (diff < 0) {
+            // Видео отстает от аудио - ускоряемся
+            frame_delay -= correction;
+            if (frame_delay < 0.001) frame_delay = 0.001;
+            
+            // При сильном отставании пропускаем кадр
+            if (diff < -0.3) {
+                video->skip_next_frame = 1;
+            }
+        } else {
+            // Видео опережает аудио - замедляемся
+            frame_delay += correction;
+            
+            // При сильном опережении повторяем кадр
+            if (diff > 0.3) {
+                video->repeat_frame = 1;
+            }
+        }
+    }
+    
+    video->last_frame_delay = frame_delay;
+    return frame_delay;
+}
+
+// Инициализация видео
 bool init_video(VideoState* video, const char* filename) {
     memset(video, 0, sizeof(VideoState));
     
-    // Открываем файл
-    if (avformat_open_input(&video->format_ctx, filename, NULL, NULL) != 0) {
-        fprintf(stderr, "Не удалось открыть файл: %s\n", filename);
+    avformat_network_init();
+    
+    int ret = avformat_open_input(&video->format_ctx, filename, NULL, NULL);
+    if (ret != 0) {
+        char errbuf[256];
+        av_strerror(ret, errbuf, sizeof(errbuf));
+        fprintf(stderr, "Не удалось открыть файл %s: %s\n", filename, errbuf);
         return false;
     }
     
-    // Получаем информацию о потоках
     if (avformat_find_stream_info(video->format_ctx, NULL) < 0) {
         fprintf(stderr, "Не удалось получить информацию о потоках\n");
         avformat_close_input(&video->format_ctx);
         return false;
     }
     
-    // Находим видео поток
     video->video_stream_index = -1;
     for (unsigned int i = 0; i < video->format_ctx->nb_streams; i++) {
         if (video->format_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
@@ -52,9 +125,8 @@ bool init_video(VideoState* video, const char* filename) {
         return false;
     }
     
-    // Настраиваем видео декодер
     AVCodecParameters* video_codec_params = video->format_ctx->streams[video->video_stream_index]->codecpar;
-    AVCodec* video_codec = avcodec_find_decoder(video_codec_params->codec_id);
+    const AVCodec* video_codec = avcodec_find_decoder(video_codec_params->codec_id);
     if (!video_codec) {
         fprintf(stderr, "Не найден видео кодек\n");
         avformat_close_input(&video->format_ctx);
@@ -82,7 +154,6 @@ bool init_video(VideoState* video, const char* filename) {
         return false;
     }
     
-    // Выделяем кадры
     video->video_frame = av_frame_alloc();
     video->rgb_frame = av_frame_alloc();
     
@@ -93,7 +164,6 @@ bool init_video(VideoState* video, const char* filename) {
         return false;
     }
     
-    // Создаем контекст для конвертации цвета
     video->sws_ctx = sws_getContext(
         video->video_codec_ctx->width, 
         video->video_codec_ctx->height, 
@@ -113,7 +183,6 @@ bool init_video(VideoState* video, const char* filename) {
         return false;
     }
     
-    // Выделяем буфер для RGB изображения
     int buffer_size = av_image_get_buffer_size(AV_PIX_FMT_RGB24, 
                                              video->video_codec_ctx->width, 
                                              video->video_codec_ctx->height, 
@@ -129,27 +198,15 @@ bool init_video(VideoState* video, const char* filename) {
         return false;
     }
     
-    // Заполняем структуру RGB кадра
-    if (av_image_fill_arrays(video->rgb_frame->data, 
-                           video->rgb_frame->linesize, 
-                           video->video_buffer,
-                           AV_PIX_FMT_RGB24, 
-                           video->video_codec_ctx->width, 
-                           video->video_codec_ctx->height, 
-                           1) < 0) {
-        fprintf(stderr, "Не удалось заполнить RGB кадр\n");
-        av_free(video->video_buffer);
-        sws_freeContext(video->sws_ctx);
-        av_frame_free(&video->video_frame);
-        av_frame_free(&video->rgb_frame);
-        avcodec_free_context(&video->video_codec_ctx);
-        avformat_close_input(&video->format_ctx);
-        return false;
-    }
+    av_image_fill_arrays(video->rgb_frame->data, 
+                        video->rgb_frame->linesize, 
+                        video->video_buffer,
+                        AV_PIX_FMT_RGB24, 
+                        video->video_codec_ctx->width, 
+                        video->video_codec_ctx->height, 
+                        1);
     
-    // Получаем FPS видео
     AVStream* video_stream = video->format_ctx->streams[video->video_stream_index];
-    video->video_time_base = av_q2d(video_stream->time_base);
     
     if (video_stream->avg_frame_rate.num > 0 && video_stream->avg_frame_rate.den > 0) {
         video->fps = av_q2d(video_stream->avg_frame_rate);
@@ -159,7 +216,16 @@ bool init_video(VideoState* video, const char* filename) {
         video->fps = 30.0;
     }
     
-    // Инициализируем аудио если есть
+    video->av_diff = 0;
+    video->last_pts = 0;
+    video->last_frame_delay = get_frame_delay(video);
+    video->frame_timer = 0;
+    video->video_clock = 0;
+    video->frame_count = 0;
+    video->skip_next_frame = 0;
+    video->repeat_frame = 0;
+    
+    memset(&video->audio_state, 0, sizeof(AudioState));
     if (has_audio_stream(filename)) {
         printf("Инициализация аудио...\n");
         if (!init_audio(&video->audio_state, filename)) {
@@ -172,25 +238,29 @@ bool init_video(VideoState* video, const char* filename) {
     printf("Видео информация:\n");
     printf("  Размер: %dx%d\n", video->video_codec_ctx->width, video->video_codec_ctx->height);
     printf("  FPS: %.2f\n", video->fps);
-    printf("  Задержка между кадрами: %.3f мс\n", get_frame_delay(video) * 1000);
+    printf("  Задержка между кадрами: %.1f мс\n", get_frame_delay(video) * 1000);
+    printf("  Длительность: %.2f сек\n", 
+           (double)video->format_ctx->duration / AV_TIME_BASE);
     printf("  Аудио: %s\n", video->audio_state.initialized ? "доступно" : "недоступно");
     
     return true;
 }
 
 void close_video(VideoState* video) {
-    // Очищаем аудио
+    if (!video) return;
+    
     if (video->audio_state.initialized) {
         cleanup_audio(&video->audio_state);
     }
     
-    // Очищаем видео
     if (video->sws_ctx) {
         sws_freeContext(video->sws_ctx);
+        video->sws_ctx = NULL;
     }
     
     if (video->video_buffer) {
         av_free(video->video_buffer);
+        video->video_buffer = NULL;
     }
     
     if (video->rgb_frame) {
@@ -210,45 +280,7 @@ void close_video(VideoState* video) {
     }
 }
 
-bool read_video_frame(VideoState* video, AppState* state) {
-    AVPacket packet;
-    packet.data = NULL;
-    packet.size = 0;
-    
-    while (av_read_frame(video->format_ctx, &packet) >= 0) {
-        if (packet.stream_index == video->video_stream_index) {
-            int ret = avcodec_send_packet(video->video_codec_ctx, &packet);
-            av_packet_unref(&packet);
-            
-            if (ret < 0) continue;
-            
-            ret = avcodec_receive_frame(video->video_codec_ctx, video->video_frame);
-            if (ret == 0) {
-                // Конвертируем в RGB
-                sws_scale(video->sws_ctx, 
-                         (uint8_t const* const*)video->video_frame->data,
-                         video->video_frame->linesize, 
-                         0, 
-                         video->video_codec_ctx->height,
-                         video->rgb_frame->data, 
-                         video->rgb_frame->linesize);
-                
-                // Отображаем кадр
-                display_image_incremental(state, video->video_buffer, 
-                                       video->video_codec_ctx->width, 
-                                       video->video_codec_ctx->height, 
-                                       3);
-                
-                return true;
-            }
-        } else {
-            av_packet_unref(&packet);
-        }
-    }
-    
-    return false;
-}
-
+// Основная функция обработки видео
 void process_video(const char* filename, AppState* state) {
     VideoState video;
     if (!init_video(&video, filename)) {
@@ -259,95 +291,172 @@ void process_video(const char* filename, AppState* state) {
     state->is_video = true;
     state->pause_video = false;
     state->playback_speed = 1.0f;
-    video.video_clock = 0;
     
-    double frame_delay = get_frame_delay(&video);
-    printf("Начинаем воспроизведение: %.1f FPS\n", 1.0 / frame_delay);
+    double base_frame_delay = get_frame_delay(&video);
+    double video_clock = 0;
+    int frames_displayed = 0;
     
-    // Запускаем аудио если оно есть
+    // Запускаем аудио с небольшой задержкой
     if (video.audio_state.initialized && state->audio_enabled) {
+        printf("Запуск аудио через 0.3 секунды...\n");
+        precise_usleep(300000);
         start_audio(&video.audio_state);
         state->audio_playing = true;
         printf("Аудио запущено\n");
     }
     
     double last_frame_time = get_current_time();
-    double video_time = 0;
-    int frames_displayed = 0;
+    double next_frame_time = last_frame_time;
     
-    printf("Управление:\n");
+    printf("\nУправление:\n");
     printf("  SPACE - пауза/продолжить\n");
     printf("  M - вкл/выкл аудио\n");
+    printf("  R - сброс синхронизации\n");
+    printf("  > - увеличить скорость\n");
+    printf("  < - уменьшить скорость\n");
     printf("  ESC - выход\n");
     printf("\nНачинаем воспроизведение...\n");
+    printf("\033[s");
+    
+    AVPacket packet;
+    int frames_skipped = 0;
+    int frames_repeated = 0;
     
     while (keep_running) {
         if (state->pause_video) {
+            if (video.audio_state.initialized && video.audio_state.playing) {
+                stop_audio(&video.audio_state);
+            }
             precise_usleep(100000);
+            handle_user_input(state, &video.video_codec_ctx->width, 
+                            &video.video_codec_ctx->height);
             continue;
         }
         
         double current_time = get_current_time();
-        double time_since_last_frame = current_time - last_frame_time;
-        double time_to_next_frame = frame_delay / state->playback_speed;
         
-        // Если пора показывать следующий кадр
-        if (time_since_last_frame >= time_to_next_frame) {
-            double frame_start = get_current_time();
+        // Проверяем, пора ли показывать следующий кадр
+        if (current_time >= next_frame_time) {
+            memset(&packet, 0, sizeof(packet));
             
-            if (read_video_frame(&video, state)) {
-                frames_displayed++;
-                video_time += frame_delay;
-                video.video_clock = video_time;
-                last_frame_time = frame_start;
-                
-                // Выводим статистику
-                if (frames_displayed % 30 == 0) {
-                    double audio_time = get_audio_time(&video.audio_state);
-                    printf("\rКадр: %4d | Видео: %5.1fс | Аудио: %5.1fс | Разница: %+.3fс",
-                           frames_displayed, video_time, audio_time, video_time - audio_time);
-                    fflush(stdout);
-                }
-                
-                // Синхронизация видео с аудио
-                if (state->audio_playing && video.audio_state.initialized) {
-                    double audio_time = video.audio_state.current_time;
-                    if (video.audio_state.playing) {
-                        audio_time = get_audio_time(&video.audio_state);
+            int ret = av_read_frame(video.format_ctx, &packet);
+            if (ret >= 0) {
+                if (packet.stream_index == video.video_stream_index) {
+                    ret = avcodec_send_packet(video.video_codec_ctx, &packet);
+                    if (ret == 0) {
+                        ret = avcodec_receive_frame(video.video_codec_ctx, video.video_frame);
+                        if (ret == 0) {
+                            video.frame_count++;
+                            
+                            // Получаем PTS
+                            double pts = video_get_pts(&video, video.video_frame);
+                            if (pts > 0) {
+                                video_clock = pts;
+                            } else {
+                                video_clock = frames_displayed * base_frame_delay;
+                            }
+                            
+                            // Вычисляем задержку и проверяем необходимость пропуска/повтора
+                            double frame_delay;
+                            if (video.audio_state.initialized && video.audio_state.playing) {
+                                frame_delay = video_sync_adjust(&video, video_clock);
+                            } else {
+                                frame_delay = base_frame_delay;
+                            }
+                            
+                            // Решаем, показывать ли кадр
+                            int show_frame = 1;
+                            
+                            if (video.skip_next_frame) {
+                                show_frame = 0;
+                                frames_skipped++;
+                                video.skip_next_frame = 0;
+                            } else if (video.repeat_frame) {
+                                // Для повтора кадра просто используем текущую задержку
+                                frames_repeated++;
+                                video.repeat_frame = 0;
+                            }
+                            
+                            if (show_frame) {
+                                sws_scale(video.sws_ctx,
+                                         (const uint8_t* const*)video.video_frame->data,
+                                         video.video_frame->linesize,
+                                         0,
+                                         video.video_codec_ctx->height,
+                                         video.rgb_frame->data,
+                                         video.rgb_frame->linesize);
+                                
+                                display_image_incremental(state, video.video_buffer,
+                                                       video.video_codec_ctx->width,
+                                                       video.video_codec_ctx->height,
+                                                       3);
+                                
+                                frames_displayed++;
+                            }
+                            
+                            // Учитываем скорость воспроизведения
+                            frame_delay = frame_delay / state->playback_speed;
+                            next_frame_time = current_time + frame_delay;
+                            
+                            // Статистика
+                            if (frames_displayed % 30 == 0 && frames_displayed > 0) {
+                                double audio_time = get_audio_time(&video.audio_state);
+                                printf("\033[u\033[K");
+                                
+                                // Индикатор синхронизации
+                                char sync_indicator = ' ';
+                                if (fabs(video_clock - audio_time) < 0.05) {
+                                    sync_indicator = '=';  // Хорошая синхронизация
+                                } else if (video_clock < audio_time) {
+                                    sync_indicator = '<';  // Видео отстает
+                                } else {
+                                    sync_indicator = '>';  // Видео опережает
+                                }
+                                
+                                printf("[%c] Кадры: %4d | Видео: %6.2fс | Аудио: %6.2fс | Разн: %+6.3fс | Зад: %4.0fms | Ск: %.1fx | Проп: %d | Повт: %d",
+                                       sync_indicator,
+                                       frames_displayed, 
+                                       video_clock, 
+                                       audio_time,
+                                       video_clock - audio_time,
+                                       frame_delay * 1000,
+                                       state->playback_speed,
+                                       frames_skipped,
+                                       frames_repeated);
+                                fflush(stdout);
+                            }
+                        }
                     }
-                    double diff = video_time - audio_time;
-                    
-                    // Если видео отстает или опережает больше чем на 0.1 секунды
-                    if (fabs(diff) > 0.1) {
-                        // Корректируем скорость воспроизведения
-                        if (diff > 0) video_time -= 0.01; // Видео впереди - замедляем
-                        else video_time += 0.01; // Видео отстает - ускоряем
-                    }
                 }
+                av_packet_unref(&packet);
             } else {
-                // Конец видео
-                printf("\nКонец видео, перемотка в начало...\n");
-                av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
-                avcodec_flush_buffers(video.video_codec_ctx);
-                
-                if (state->audio_playing && video.audio_state.initialized) {
-                    stop_audio(&video.audio_state);
-                    start_audio(&video.audio_state);
+                if (ret == AVERROR_EOF) {
+                    printf("\n=== Конец видео, перемотка в начало ===\n");
+                    av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+                    avcodec_flush_buffers(video.video_codec_ctx);
+                    
+                    if (video.audio_state.initialized && state->audio_playing) {
+                        stop_audio(&video.audio_state);
+                        precise_usleep(300000);
+                        start_audio(&video.audio_state);
+                    }
+                    
+                    frames_displayed = 0;
+                    frames_skipped = 0;
+                    frames_repeated = 0;
+                    video_clock = 0;
+                    last_frame_time = get_current_time();
+                    next_frame_time = last_frame_time;
+                } else {
+                    char errbuf[256];
+                    av_strerror(ret, errbuf, sizeof(errbuf));
+                    fprintf(stderr, "\nОшибка чтения кадра: %s\n", errbuf);
+                    break;
                 }
-                
-                video_time = 0;
-                last_frame_time = get_current_time();
-                frames_displayed = 0;
-            }
-        } else {
-            // Ждем до следующего кадра
-            double wait_time = time_to_next_frame - time_since_last_frame;
-            if (wait_time > 0) {
-                precise_usleep((long)(wait_time * 1000000));
             }
         }
         
-        // Обработка пользовательского ввода
+        // Обработка ввода
         struct timeval tv = {0, 0};
         fd_set fds;
         FD_ZERO(&fds);
@@ -363,31 +472,60 @@ void process_video(const char* filename, AppState* state) {
                             stop_audio(&video.audio_state);
                         } else {
                             start_audio(&video.audio_state);
+                            last_frame_time = get_current_time();
+                            next_frame_time = last_frame_time;
                         }
                     }
                     break;
+                    
                 case 'm': case 'M':
                     if (video.audio_state.initialized) {
                         toggle_audio(&video.audio_state);
                         state->audio_playing = video.audio_state.playing;
                     }
                     break;
+                    
+                case 'r': case 'R':
+                    printf("\n🔄 Сброс синхронизации...\n");
+                    if (video.audio_state.initialized) {
+                        stop_audio(&video.audio_state);
+                        precise_usleep(300000);
+                        start_audio(&video.audio_state);
+                    }
+                    av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+                    avcodec_flush_buffers(video.video_codec_ctx);
+                    frames_displayed = 0;
+                    frames_skipped = 0;
+                    frames_repeated = 0;
+                    video_clock = 0;
+                    last_frame_time = get_current_time();
+                    next_frame_time = last_frame_time;
+                    break;
+                    
+                case '>':
+                    state->playback_speed = fmin(2.0, state->playback_speed + 0.1);
+                    printf("\n⚡ Скорость: %.1fx\n", state->playback_speed);
+                    break;
+                    
+                case '<':
+                    state->playback_speed = fmax(0.5, state->playback_speed - 0.1);
+                    printf("\n🐢 Скорость: %.1fx\n", state->playback_speed);
+                    break;
+                    
                 case ESC_KEY:
                     keep_running = 0;
                     break;
+                    
                 default:
-                    handle_user_input(state, &video.video_codec_ctx->width, 
+                    handle_user_input(state, &video.video_codec_ctx->width,
                                     &video.video_codec_ctx->height);
                     break;
             }
         }
+        
+        precise_usleep(1000);
     }
     
-    printf("\nОстанавливаем воспроизведение...\n");
-    
-    if (video.audio_state.initialized) {
-        cleanup_audio(&video.audio_state);
-    }
-    
+    printf("\n\nОстанавливаем воспроизведение...\n");
     close_video(&video);
 }

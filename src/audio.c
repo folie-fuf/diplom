@@ -215,6 +215,23 @@ double audio_get_time(AudioSystem* audio) {
     
     audio->current_time = audio_ctx.start_offset + elapsed;
     
+    // Добавим проверку на слишком быстрое/медленное аудио
+    static double last_time = 0;
+    static double last_real_time = 0;
+    
+    if (last_time != 0) {
+        double time_diff = audio->current_time - last_time;
+        double real_diff = elapsed - last_real_time;
+        
+        if (fabs(time_diff - real_diff) > 0.1) {
+            fprintf(stderr, "\n⚠ Аудио рассинхронизация: ожидалось %.3fс, прошло %.3fс\n",
+                    time_diff, real_diff);
+        }
+    }
+    
+    last_time = audio->current_time;
+    last_real_time = elapsed;
+    
     return audio->current_time;
 }
 
