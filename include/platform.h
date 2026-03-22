@@ -3,8 +3,6 @@
 
 #include <stdbool.h>
 
-// Автоматически определенные настройки платформы
-
 // Определение операционной системы
 #if defined(_WIN32) || defined(_WIN64)
     #define OS_WINDOWS 1
@@ -41,16 +39,13 @@
 #define AUDIO_MPLAYER 3
 #define AUDIO_VLC 4
 #define AUDIO_SDL2 5
-#define AUDIO_DIRECT_SOUND 6
 
-// По умолчанию - без аудио
 #ifndef AUDIO_BACKEND
     #define AUDIO_BACKEND 0
 #endif
 
-// Функции для работы с платформой
 const char* get_platform_name(void);
 const char* get_audio_backend_name(void);
 int check_audio_support(void);
 
-#endif // PLATFORM_H
+#endif

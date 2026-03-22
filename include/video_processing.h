@@ -9,10 +9,9 @@
 #include <libavutil/imgutils.h>
 #include <libavutil/time.h>
 
-// Свои константы синхронизации (не конфликтуют с app_state.h)
-#define VIDEO_SYNC_THRESHOLD 0.04      // 40ms - порог для коррекции
-#define VIDEO_SYNC_MAX_DIFF 0.1        // 100ms - максимальная коррекция за раз
-#define VIDEO_AUDIO_DELAY_BUFFER 0.15  // 150ms - буфер для аудио
+#define VIDEO_SYNC_THRESHOLD 0.04
+#define VIDEO_SYNC_MAX_DIFF 0.1
+#define VIDEO_AUDIO_DELAY_BUFFER 0.15
 
 typedef struct VideoState {
     AVFormatContext* format_ctx;
@@ -29,12 +28,11 @@ typedef struct VideoState {
     double frame_timer;
     int64_t frame_count;
     
-    // Для синхронизации
     double av_diff;
     double last_pts;
     double last_frame_delay;
-    int skip_next_frame;  // Флаг пропуска следующего кадра при сильном отставании
-    int repeat_frame;      // Флаг повтора текущего кадра
+    int skip_next_frame;
+    int repeat_frame;
     
     AudioState audio_state;
 } VideoState;

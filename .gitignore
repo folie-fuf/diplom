@@ -1,0 +1,5 @@
+# Игнорировать служебные файлы Windows
+*.webp:Zone.Identifier
+*.jpg:Zone.Identifier
+*.mp4:Zone.Identifier
+*.Zone.Identifier

@@ -9,12 +9,7 @@
 
 extern volatile sig_atomic_t keep_running;
 
-// Используем свои константы, не конфликтующие с app_state.h
-#define SYNC_THRESHOLD 0.04      // 40ms - порог для коррекции
-#define SYNC_MAX_CORRECTION 0.1  // 100ms - максимальная коррекция за раз
-#define AUDIO_START_DELAY 0.15   // 150ms - буфер для аудио
-
-static double get_current_time() {
+static double get_current_time(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1000000000.0;
@@ -27,7 +22,6 @@ static double get_frame_delay(VideoState* video) {
     return 1.0 / 30.0;
 }
 
-// Получение PTS кадра
 double video_get_pts(VideoState* video, AVFrame* frame) {
     double pts = 0;
     if (frame && frame->pts != AV_NOPTS_VALUE) {
@@ -39,7 +33,6 @@ double video_get_pts(VideoState* video, AVFrame* frame) {
     return pts;
 }
 
-// Улучшенная синхронизация видео с аудио
 double video_sync_adjust(VideoState* video, double pts) {
     double frame_delay = get_frame_delay(video);
     
@@ -51,37 +44,33 @@ double video_sync_adjust(VideoState* video, double pts) {
     
     double audio_time = get_audio_time(&video->audio_state);
     
-    // Добавляем небольшой буфер для аудио в начале
-    if (video->frame_count < 30) {
-        audio_time += AUDIO_START_DELAY;
-    }
-    
     double diff = pts - audio_time;
     video->av_diff = diff;
     
-    // Сбрасываем флаги по умолчанию
     video->skip_next_frame = 0;
     video->repeat_frame = 0;
     
-    // Динамическая коррекция
-    if (fabs(diff) > SYNC_THRESHOLD) {
-        double correction = fmin(fabs(diff) * 0.3, SYNC_MAX_CORRECTION);
+    // Более агрессивная синхронизация для начальных кадров
+    double threshold = (video->frame_count < 60) ? 0.02 : VIDEO_SYNC_THRESHOLD;
+    
+    if (fabs(diff) > threshold) {
+        double correction = fmin(fabs(diff) * 0.5, VIDEO_SYNC_MAX_DIFF);
         
         if (diff < 0) {
-            // Видео отстает от аудио - ускоряемся
+            // Видео отстает - ускоряемся
             frame_delay -= correction;
             if (frame_delay < 0.001) frame_delay = 0.001;
             
             // При сильном отставании пропускаем кадр
-            if (diff < -0.3) {
+            if (diff < -0.1) {
                 video->skip_next_frame = 1;
             }
         } else {
-            // Видео опережает аудио - замедляемся
+            // Видео опережает - замедляемся
             frame_delay += correction;
             
             // При сильном опережении повторяем кадр
-            if (diff > 0.3) {
+            if (diff > 0.1) {
                 video->repeat_frame = 1;
             }
         }
@@ -91,7 +80,6 @@ double video_sync_adjust(VideoState* video, double pts) {
     return frame_delay;
 }
 
-// Инициализация видео
 bool init_video(VideoState* video, const char* filename) {
     memset(video, 0, sizeof(VideoState));
     
@@ -101,12 +89,12 @@ bool init_video(VideoState* video, const char* filename) {
     if (ret != 0) {
         char errbuf[256];
         av_strerror(ret, errbuf, sizeof(errbuf));
-        fprintf(stderr, "Не удалось открыть файл %s: %s\n", filename, errbuf);
+        fprintf(stderr, "Failed to open file %s: %s\n", filename, errbuf);
         return false;
     }
     
     if (avformat_find_stream_info(video->format_ctx, NULL) < 0) {
-        fprintf(stderr, "Не удалось получить информацию о потоках\n");
+        fprintf(stderr, "Failed to find stream info\n");
         avformat_close_input(&video->format_ctx);
         return false;
     }
@@ -120,7 +108,7 @@ bool init_video(VideoState* video, const char* filename) {
     }
     
     if (video->video_stream_index == -1) {
-        fprintf(stderr, "Не найден видео поток\n");
+        fprintf(stderr, "No video stream found\n");
         avformat_close_input(&video->format_ctx);
         return false;
     }
@@ -128,27 +116,27 @@ bool init_video(VideoState* video, const char* filename) {
     AVCodecParameters* video_codec_params = video->format_ctx->streams[video->video_stream_index]->codecpar;
     const AVCodec* video_codec = avcodec_find_decoder(video_codec_params->codec_id);
     if (!video_codec) {
-        fprintf(stderr, "Не найден видео кодек\n");
+        fprintf(stderr, "Video codec not found\n");
         avformat_close_input(&video->format_ctx);
         return false;
     }
     
     video->video_codec_ctx = avcodec_alloc_context3(video_codec);
     if (!video->video_codec_ctx) {
-        fprintf(stderr, "Не удалось выделить контекст кодека\n");
+        fprintf(stderr, "Failed to allocate codec context\n");
         avformat_close_input(&video->format_ctx);
         return false;
     }
     
     if (avcodec_parameters_to_context(video->video_codec_ctx, video_codec_params) < 0) {
-        fprintf(stderr, "Не удалось скопировать параметры кодека\n");
+        fprintf(stderr, "Failed to copy codec parameters\n");
         avcodec_free_context(&video->video_codec_ctx);
         avformat_close_input(&video->format_ctx);
         return false;
     }
     
     if (avcodec_open2(video->video_codec_ctx, video_codec, NULL) < 0) {
-        fprintf(stderr, "Не удалось открыть кодек\n");
+        fprintf(stderr, "Failed to open codec\n");
         avcodec_free_context(&video->video_codec_ctx);
         avformat_close_input(&video->format_ctx);
         return false;
@@ -158,7 +146,7 @@ bool init_video(VideoState* video, const char* filename) {
     video->rgb_frame = av_frame_alloc();
     
     if (!video->video_frame || !video->rgb_frame) {
-        fprintf(stderr, "Не удалось выделить кадры\n");
+        fprintf(stderr, "Failed to allocate frames\n");
         avcodec_free_context(&video->video_codec_ctx);
         avformat_close_input(&video->format_ctx);
         return false;
@@ -175,7 +163,7 @@ bool init_video(VideoState* video, const char* filename) {
     );
     
     if (!video->sws_ctx) {
-        fprintf(stderr, "Не удалось создать контекст масштабирования\n");
+        fprintf(stderr, "Failed to create scaling context\n");
         av_frame_free(&video->video_frame);
         av_frame_free(&video->rgb_frame);
         avcodec_free_context(&video->video_codec_ctx);
@@ -189,7 +177,7 @@ bool init_video(VideoState* video, const char* filename) {
                                              1);
     video->video_buffer = (uint8_t*)av_malloc(buffer_size);
     if (!video->video_buffer) {
-        fprintf(stderr, "Не удалось выделить буфер\n");
+        fprintf(stderr, "Failed to allocate buffer\n");
         sws_freeContext(video->sws_ctx);
         av_frame_free(&video->video_frame);
         av_frame_free(&video->rgb_frame);
@@ -227,21 +215,18 @@ bool init_video(VideoState* video, const char* filename) {
     
     memset(&video->audio_state, 0, sizeof(AudioState));
     if (has_audio_stream(filename)) {
-        printf("Инициализация аудио...\n");
         if (!init_audio(&video->audio_state, filename)) {
-            fprintf(stderr, "Не удалось инициализировать аудио\n");
-        } else {
-            printf("Аудио инициализировано успешно\n");
+            fprintf(stderr, "Failed to initialize audio\n");
         }
     }
     
-    printf("Видео информация:\n");
-    printf("  Размер: %dx%d\n", video->video_codec_ctx->width, video->video_codec_ctx->height);
+    printf("Video info:\n");
+    printf("  Size: %dx%d\n", video->video_codec_ctx->width, video->video_codec_ctx->height);
     printf("  FPS: %.2f\n", video->fps);
-    printf("  Задержка между кадрами: %.1f мс\n", get_frame_delay(video) * 1000);
-    printf("  Длительность: %.2f сек\n", 
+    printf("  Frame delay: %.1f ms\n", get_frame_delay(video) * 1000);
+    printf("  Duration: %.2f sec\n", 
            (double)video->format_ctx->duration / AV_TIME_BASE);
-    printf("  Аудио: %s\n", video->audio_state.initialized ? "доступно" : "недоступно");
+    printf("  Audio: %s\n", video->audio_state.initialized ? "available" : "unavailable");
     
     return true;
 }
@@ -280,11 +265,10 @@ void close_video(VideoState* video) {
     }
 }
 
-// Основная функция обработки видео
 void process_video(const char* filename, AppState* state) {
     VideoState video;
     if (!init_video(&video, filename)) {
-        fprintf(stderr, "Ошибка инициализации видео\n");
+        fprintf(stderr, "Video initialization failed\n");
         return;
     }
     
@@ -296,26 +280,58 @@ void process_video(const char* filename, AppState* state) {
     double video_clock = 0;
     int frames_displayed = 0;
     
-    // Запускаем аудио с небольшой задержкой
-    if (video.audio_state.initialized && state->audio_enabled) {
-        printf("Запуск аудио через 0.3 секунды...\n");
-        precise_usleep(300000);
-        start_audio(&video.audio_state);
-        state->audio_playing = true;
-        printf("Аудио запущено\n");
+    // Получаем PTS первого видео кадра для синхронизации
+    double first_video_pts = 0;
+    AVPacket first_packet;
+    int found_first_pts = 0;
+    
+    // Читаем первый пакет чтобы получить PTS
+    while (!found_first_pts && av_read_frame(video.format_ctx, &first_packet) >= 0) {
+        if (first_packet.stream_index == video.video_stream_index) {
+            if (avcodec_send_packet(video.video_codec_ctx, &first_packet) == 0) {
+                if (avcodec_receive_frame(video.video_codec_ctx, video.video_frame) == 0) {
+                    first_video_pts = video_get_pts(&video, video.video_frame);
+                    found_first_pts = 1;
+                }
+            }
+        }
+        av_packet_unref(&first_packet);
+        if (found_first_pts) break;
     }
+    
+    // Возвращаемся в начало файла
+    av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
+    avcodec_flush_buffers(video.video_codec_ctx);
+    
+    printf("First video PTS: %.3f seconds\n", first_video_pts);
+    
+    // Запускаем аудио с правильной синхронизацией
+    if (video.audio_state.initialized && state->audio_enabled) {
+        printf("Starting audio with delay: %.3f seconds\n", first_video_pts);
+        // Запускаем аудио с задержкой равной PTS первого видео кадра
+        if (audio_play(video.audio_state.system, filename, first_video_pts)) {
+            video.audio_state.playing = true;
+            state->audio_playing = true;
+            printf("Audio started successfully\n");
+        } else {
+            printf("Failed to start audio\n");
+        }
+    }
+    
+    // Небольшая задержка перед стартом видео, чтобы аудио успело запуститься
+    precise_usleep(50000); // 50ms задержка
     
     double last_frame_time = get_current_time();
     double next_frame_time = last_frame_time;
     
-    printf("\nУправление:\n");
-    printf("  SPACE - пауза/продолжить\n");
-    printf("  M - вкл/выкл аудио\n");
-    printf("  R - сброс синхронизации\n");
-    printf("  > - увеличить скорость\n");
-    printf("  < - уменьшить скорость\n");
-    printf("  ESC - выход\n");
-    printf("\nНачинаем воспроизведение...\n");
+    printf("\nControls:\n");
+    printf("  SPACE - pause/resume\n");
+    printf("  M - toggle audio\n");
+    printf("  R - reset sync\n");
+    printf("  > - increase speed\n");
+    printf("  < - decrease speed\n");
+    printf("  ESC - exit\n");
+    printf("\nPlaying...\n");
     printf("\033[s");
     
     AVPacket packet;
@@ -335,7 +351,6 @@ void process_video(const char* filename, AppState* state) {
         
         double current_time = get_current_time();
         
-        // Проверяем, пора ли показывать следующий кадр
         if (current_time >= next_frame_time) {
             memset(&packet, 0, sizeof(packet));
             
@@ -348,7 +363,6 @@ void process_video(const char* filename, AppState* state) {
                         if (ret == 0) {
                             video.frame_count++;
                             
-                            // Получаем PTS
                             double pts = video_get_pts(&video, video.video_frame);
                             if (pts > 0) {
                                 video_clock = pts;
@@ -356,7 +370,6 @@ void process_video(const char* filename, AppState* state) {
                                 video_clock = frames_displayed * base_frame_delay;
                             }
                             
-                            // Вычисляем задержку и проверяем необходимость пропуска/повтора
                             double frame_delay;
                             if (video.audio_state.initialized && video.audio_state.playing) {
                                 frame_delay = video_sync_adjust(&video, video_clock);
@@ -364,7 +377,6 @@ void process_video(const char* filename, AppState* state) {
                                 frame_delay = base_frame_delay;
                             }
                             
-                            // Решаем, показывать ли кадр
                             int show_frame = 1;
                             
                             if (video.skip_next_frame) {
@@ -372,7 +384,6 @@ void process_video(const char* filename, AppState* state) {
                                 frames_skipped++;
                                 video.skip_next_frame = 0;
                             } else if (video.repeat_frame) {
-                                // Для повтора кадра просто используем текущую задержку
                                 frames_repeated++;
                                 video.repeat_frame = 0;
                             }
@@ -394,33 +405,30 @@ void process_video(const char* filename, AppState* state) {
                                 frames_displayed++;
                             }
                             
-                            // Учитываем скорость воспроизведения
                             frame_delay = frame_delay / state->playback_speed;
                             next_frame_time = current_time + frame_delay;
                             
-                            // Статистика
                             if (frames_displayed % 30 == 0 && frames_displayed > 0) {
                                 double audio_time = get_audio_time(&video.audio_state);
                                 printf("\033[u\033[K");
                                 
-                                // Индикатор синхронизации
                                 char sync_indicator = ' ';
                                 if (fabs(video_clock - audio_time) < 0.05) {
-                                    sync_indicator = '=';  // Хорошая синхронизация
+                                    sync_indicator = '=';
                                 } else if (video_clock < audio_time) {
-                                    sync_indicator = '<';  // Видео отстает
+                                    sync_indicator = '<';
                                 } else {
-                                    sync_indicator = '>';  // Видео опережает
+                                    sync_indicator = '>';
                                 }
                                 
-                                printf("[%c] Кадры: %4d | Видео: %6.2fс | Аудио: %6.2fс | Разн: %+6.3fс | Зад: %4.0fms | Ск: %.1fx | Проп: %d | Повт: %d",
+                                printf("[%c] Frames: %4d | Video: %6.2fs | Audio: %6.2fs | Diff: %+6.3fs | Delay: %4.0fms | Speed: %.1fx | Skip: %d | Repeat: %d",
                                        sync_indicator,
                                        frames_displayed, 
                                        video_clock, 
                                        audio_time,
                                        video_clock - audio_time,
                                        frame_delay * 1000,
-                                       state->playback_speed,
+                                       (double)state->playback_speed,
                                        frames_skipped,
                                        frames_repeated);
                                 fflush(stdout);
@@ -431,14 +439,16 @@ void process_video(const char* filename, AppState* state) {
                 av_packet_unref(&packet);
             } else {
                 if (ret == AVERROR_EOF) {
-                    printf("\n=== Конец видео, перемотка в начало ===\n");
+                    printf("\n=== End of video, looping ===\n");
                     av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
                     avcodec_flush_buffers(video.video_codec_ctx);
                     
                     if (video.audio_state.initialized && state->audio_playing) {
                         stop_audio(&video.audio_state);
-                        precise_usleep(300000);
-                        start_audio(&video.audio_state);
+                        // При перемотке снова запускаем аудио с правильной задержкой
+                        if (audio_play(video.audio_state.system, filename, first_video_pts)) {
+                            video.audio_state.playing = true;
+                        }
                     }
                     
                     frames_displayed = 0;
@@ -450,13 +460,12 @@ void process_video(const char* filename, AppState* state) {
                 } else {
                     char errbuf[256];
                     av_strerror(ret, errbuf, sizeof(errbuf));
-                    fprintf(stderr, "\nОшибка чтения кадра: %s\n", errbuf);
+                    fprintf(stderr, "\nFrame read error: %s\n", errbuf);
                     break;
                 }
             }
         }
         
-        // Обработка ввода
         struct timeval tv = {0, 0};
         fd_set fds;
         FD_ZERO(&fds);
@@ -471,6 +480,14 @@ void process_video(const char* filename, AppState* state) {
                         if (state->pause_video) {
                             stop_audio(&video.audio_state);
                         } else {
+                            // При возобновлении синхронизируем с текущей позиции
+                            double current_audio_time = get_audio_time(&video.audio_state);
+                            if (current_audio_time > 0) {
+                                av_seek_frame(video.format_ctx, -1, 
+                                             (int64_t)(current_audio_time * AV_TIME_BASE), 
+                                             AVSEEK_FLAG_BACKWARD);
+                                avcodec_flush_buffers(video.video_codec_ctx);
+                            }
                             start_audio(&video.audio_state);
                             last_frame_time = get_current_time();
                             next_frame_time = last_frame_time;
@@ -486,11 +503,13 @@ void process_video(const char* filename, AppState* state) {
                     break;
                     
                 case 'r': case 'R':
-                    printf("\n🔄 Сброс синхронизации...\n");
+                    printf("\n=== Resetting sync ===\n");
                     if (video.audio_state.initialized) {
                         stop_audio(&video.audio_state);
-                        precise_usleep(300000);
-                        start_audio(&video.audio_state);
+                        // Запускаем аудио с правильной задержкой
+                        if (audio_play(video.audio_state.system, filename, first_video_pts)) {
+                            video.audio_state.playing = true;
+                        }
                     }
                     av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
                     avcodec_flush_buffers(video.video_codec_ctx);
@@ -504,12 +523,10 @@ void process_video(const char* filename, AppState* state) {
                     
                 case '>':
                     state->playback_speed = fmin(2.0, state->playback_speed + 0.1);
-                    printf("\n⚡ Скорость: %.1fx\n", state->playback_speed);
                     break;
                     
                 case '<':
                     state->playback_speed = fmax(0.5, state->playback_speed - 0.1);
-                    printf("\n🐢 Скорость: %.1fx\n", state->playback_speed);
                     break;
                     
                 case ESC_KEY:
@@ -526,6 +543,6 @@ void process_video(const char* filename, AppState* state) {
         precise_usleep(1000);
     }
     
-    printf("\n\nОстанавливаем воспроизведение...\n");
+    printf("\n\nStopping playback...\n");
     close_video(&video);
 }

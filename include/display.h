@@ -2,12 +2,12 @@
 #define DISPLAY_H
 
 #include "app_state.h"
-#include <stdint.h>  // Добавлено для uint8_t
+#include <stdint.h>
 
 void determine_scale(AppState* state);
 void display_image_incremental(AppState* state, const uint8_t *buffer, 
                                int original_width, int original_height, int channels);
-void init_ansi_colors();
+void init_ansi_colors(void);
 void init_frame_buffers(AppState* state);
 void free_frame_buffers(AppState* state);
 char get_ascii_char(int brightness);

@@ -1,6 +1,5 @@
 #include "../include/audio.h"
 #include "../include/platform.h"
-#include "../include/utils.h"
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -10,40 +9,41 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
-#include <sys/types.h>
-#include <sys/stat.h>
 
-// Общие данные
-static struct {
+typedef struct {
     pid_t pid;
     struct timespec start_time;
     double start_offset;
     const char* current_file;
-} audio_ctx = {0};
+} AudioContext;
 
-// Проверка доступности аудио плеера
+static AudioContext audio_ctx = {0};
+static const char* cached_audio_backend = NULL;
+
 static bool check_audio_player(const char* player) {
     char cmd[256];
     snprintf(cmd, sizeof(cmd), "which %s > /dev/null 2>&1", player);
     return system(cmd) == 0;
 }
 
-// Выбор лучшего доступного аудио плеера
-static const char* select_audio_backend(void) {
+static const char* select_audio_backend_cached(void) {
+    if (cached_audio_backend) {
+        return cached_audio_backend;
+    }
+    
     const char* players[] = {"ffplay", "mpv", "mplayer", "vlc", NULL};
     
     for (int i = 0; players[i] != NULL; i++) {
         if (check_audio_player(players[i])) {
-            return players[i];
+            cached_audio_backend = players[i];
+            return cached_audio_backend;
         }
     }
     
     return NULL;
 }
 
-// Запуск внешнего аудио плеера
 static bool start_external_player(const char* player, const char* filename, double start_time) {
-    // Останавливаем предыдущий процесс если есть
     if (audio_ctx.pid > 0) {
         kill(-audio_ctx.pid, SIGTERM);
         waitpid(audio_ctx.pid, NULL, 0);
@@ -52,10 +52,8 @@ static bool start_external_player(const char* player, const char* filename, doub
     
     pid_t pid = fork();
     if (pid == 0) {
-        // Дочерний процесс
         setsid();
         
-        // Перенаправляем вывод в /dev/null
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull != -1) {
             dup2(devnull, STDOUT_FILENO);
@@ -63,45 +61,37 @@ static bool start_external_player(const char* player, const char* filename, doub
             close(devnull);
         }
         
+        char start_str[32];
+        snprintf(start_str, sizeof(start_str), "%.2f", start_time);
+        
         if (strcmp(player, "ffplay") == 0) {
-            char start_str[32];
-            snprintf(start_str, sizeof(start_str), "%.2f", start_time);
             execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                    "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "mpv") == 0) {
-            char start_str[32];
-            snprintf(start_str, sizeof(start_str), "%.2f", start_time);
             execlp("mpv", "mpv", "--no-video", "--no-terminal", "--quiet",
                    "--start", start_str, filename, NULL);
         } else if (strcmp(player, "mplayer") == 0) {
-            char start_str[32];
-            snprintf(start_str, sizeof(start_str), "%.2f", start_time);
             execlp("mplayer", "mplayer", "-quiet", "-vo", "null",
                    "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "vlc") == 0) {
-            char start_str[32];
-            snprintf(start_str, sizeof(start_str), "%.2f", start_time);
             execlp("cvlc", "cvlc", "--play-and-exit", "--no-video", 
                    "--start-time", start_str, filename, NULL);
         }
         
-        // Если execlp вернулся, значит ошибка
         _exit(1);
     } else if (pid > 0) {
         audio_ctx.pid = pid;
         audio_ctx.start_offset = start_time;
         audio_ctx.current_file = filename;
         clock_gettime(CLOCK_MONOTONIC, &audio_ctx.start_time);
-        usleep(200000); // Даем время на запуск
+        usleep(200000);
         return true;
     }
     
     return false;
 }
 
-// Проверка наличия аудио потока
 bool audio_has_stream(const char* filename) {
-    // Простая проверка по расширению
     const char* ext = strrchr(filename, '.');
     if (!ext) return false;
     
@@ -127,30 +117,21 @@ bool audio_has_stream(const char* filename) {
     return false;
 }
 
-// Основные функции аудио
 bool audio_init(AudioSystem* audio, const char* filename) {
     memset(audio, 0, sizeof(AudioSystem));
     
-    // Проверяем наличие аудио в файле
     if (!audio_has_stream(filename)) {
         return false;
     }
     
-    // Выбираем лучший доступный бэкенд
-    const char* backend = select_audio_backend();
+    const char* backend = select_audio_backend_cached();
     if (backend) {
-        if (strcmp(backend, "ffplay") == 0) {
-            audio->backend = AUDIO_FFPLAY;
-        } else if (strcmp(backend, "mpv") == 0) {
-            audio->backend = AUDIO_MPV;
-        } else if (strcmp(backend, "mplayer") == 0) {
-            audio->backend = AUDIO_MPLAYER;
-        } else if (strcmp(backend, "vlc") == 0) {
-            audio->backend = AUDIO_VLC;
-        }
+        if (strcmp(backend, "ffplay") == 0) audio->backend = AUDIO_FFPLAY;
+        else if (strcmp(backend, "mpv") == 0) audio->backend = AUDIO_MPV;
+        else if (strcmp(backend, "mplayer") == 0) audio->backend = AUDIO_MPLAYER;
+        else if (strcmp(backend, "vlc") == 0) audio->backend = AUDIO_VLC;
         
         audio->available = true;
-        // Сохраняем имя файла для последующего использования
         audio->platform_data = strdup(filename);
         return true;
     }
@@ -185,8 +166,7 @@ void audio_stop(AudioSystem* audio) {
     
     if (audio_ctx.pid > 0) {
         kill(-audio_ctx.pid, SIGTERM);
-        int status;
-        waitpid(audio_ctx.pid, &status, 0);
+        waitpid(audio_ctx.pid, NULL, 0);
         audio_ctx.pid = 0;
     }
     
@@ -198,7 +178,6 @@ double audio_get_time(AudioSystem* audio) {
         return audio->current_time;
     }
     
-    // Проверяем, жив ли процесс
     int status;
     if (waitpid(audio_ctx.pid, &status, WNOHANG) != 0) {
         audio->playing = false;
@@ -206,7 +185,6 @@ double audio_get_time(AudioSystem* audio) {
         return audio->current_time;
     }
     
-    // Рассчитываем прошедшее время
     struct timespec current_time;
     clock_gettime(CLOCK_MONOTONIC, &current_time);
     
@@ -214,24 +192,6 @@ double audio_get_time(AudioSystem* audio) {
                     (double)(current_time.tv_nsec - audio_ctx.start_time.tv_nsec) / 1000000000.0;
     
     audio->current_time = audio_ctx.start_offset + elapsed;
-    
-    // Добавим проверку на слишком быстрое/медленное аудио
-    static double last_time = 0;
-    static double last_real_time = 0;
-    
-    if (last_time != 0) {
-        double time_diff = audio->current_time - last_time;
-        double real_diff = elapsed - last_real_time;
-        
-        if (fabs(time_diff - real_diff) > 0.1) {
-            fprintf(stderr, "\n⚠ Аудио рассинхронизация: ожидалось %.3fс, прошло %.3fс\n",
-                    time_diff, real_diff);
-        }
-    }
-    
-    last_time = audio->current_time;
-    last_real_time = elapsed;
-    
     return audio->current_time;
 }
 
@@ -244,7 +204,6 @@ void audio_cleanup(AudioSystem* audio) {
     memset(audio, 0, sizeof(AudioSystem));
 }
 
-// Функции для video_processing
 bool has_audio_stream(const char* filename) {
     return audio_has_stream(filename);
 }

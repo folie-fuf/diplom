@@ -13,8 +13,6 @@
 #define DEFAULT_MOVE_STEP 5
 #define TARGET_FPS 30
 #define FRAME_DELAY (1000000 / TARGET_FPS)
-#define AV_SYNC_THRESHOLD 0.01
-#define AV_NOSYNC_THRESHOLD 10.0
 
 extern volatile sig_atomic_t keep_running;
 
@@ -29,7 +27,6 @@ typedef struct {
     uint8_t r, g, b;
 } PixelState;
 
-// Предварительное объявление VideoState чтобы избежать циклических зависимостей
 typedef struct VideoState VideoState;
 
 typedef struct {
@@ -52,12 +49,10 @@ typedef struct {
     float playback_speed;
     bool audio_enabled;
     
-    // Для инкрементального обновления
     PixelState* previous_frame;
     PixelState* current_frame;
     bool first_frame;
     
-    // Для аудио
     bool audio_playing;
 } AppState;
 

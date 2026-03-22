@@ -27,11 +27,9 @@ const char* get_audio_backend_name(void) {
 }
 
 int check_audio_support(void) {
-    // Проверяем доступность аудио
 #if OS_WSL
-    printf("⚠ WSL обнаружен. Аудио может требовать дополнительной настройки.\n");
-    printf("   Рекомендуется настроить PulseAudio на Windows.\n");
+    printf("⚠ WSL detected. Audio may require additional configuration.\n");
+    printf("   PulseAudio setup on Windows is recommended.\n");
 #endif
-    
     return AUDIO_BACKEND != 0;
 }

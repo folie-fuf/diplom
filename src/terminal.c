@@ -1,5 +1,5 @@
 #include "../include/terminal.h"
-#include "../include/utils.h"  // Добавлено для fmin/fmax
+#include "../include/display.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
@@ -9,6 +9,7 @@
 #include <sys/select.h>
 #include <string.h>
 #include <termios.h>
+#include <math.h>
 
 volatile sig_atomic_t keep_running = 1;
 
@@ -23,16 +24,13 @@ void initialize_terminal(AppState* state) {
     
     setvbuf(stdout, NULL, _IOFBF, 65536);
     
-    // Скрыть курсор и очистить экран
     printf("\033[?25l\033[H\033[J");
     fflush(stdout);
 }
 
 void restore_terminal(AppState* state) {
-    // Показать курсор и очистить экран
     printf("\033[?25h\033[H\033[J");
     fflush(stdout);
-    
     tcsetattr(STDIN_FILENO, TCSANOW, &state->original_termios);
 }
 
@@ -52,7 +50,7 @@ void get_terminal_size(int *width, int *height) {
     }
 }
 
-void print_help() {
+void print_help(void) {
     printf("\033[H\033[J");
     printf("\n=== ASCII Video/Image Viewer Help ===\n");
     printf("Navigation:\n");
@@ -174,14 +172,12 @@ void handle_user_input(AppState* state, int* original_width, int* original_heigh
             
         case 'm': case 'M':
             state->audio_enabled = !state->audio_enabled;
-            // Аудио управление обрабатывается в video_processing.c
             break;
     }
     
-    int max_offset_x = *original_width * state->scale_factor - state->target_width;
-    int max_offset_y = *original_height * state->scale_factor - state->target_height;
+    int max_offset_x = (int)(*original_width * state->scale_factor) - state->target_width;
+    int max_offset_y = (int)(*original_height * state->scale_factor) - state->target_height;
     
-    // Используем функции из utils.h
     state->offset_x = fmax(0, fmin(state->offset_x, max_offset_x));
     state->offset_y = fmax(0, fmin(state->offset_y, max_offset_y));
 }
