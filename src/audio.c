@@ -9,12 +9,14 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <stdio.h>
+#include <math.h>
 
 typedef struct {
     pid_t pid;
     struct timespec start_time;
     double start_offset;
     const char* current_file;
+    float volume;  //хранение громкости
 } AudioContext;
 
 static AudioContext audio_ctx = {0};
@@ -43,11 +45,17 @@ static const char* select_audio_backend_cached(void) {
     return NULL;
 }
 
-static bool start_external_player(const char* player, const char* filename, double start_time) {
+static bool start_external_player(const char* player, const char* filename, double start_time, float volume) {
     if (audio_ctx.pid > 0) {
         kill(-audio_ctx.pid, SIGTERM);
         waitpid(audio_ctx.pid, NULL, 0);
         audio_ctx.pid = 0;
+    }
+    
+    // Ограничиваем громкость разумными пределами (30% - 100%)
+    float safe_volume = fmax(0.3, fmin(1.0, volume));
+    if (volume > 0.7) {
+        safe_volume = 0.7;  // Принудительное ограничение для устранения треска
     }
     
     pid_t pid = fork();
@@ -64,18 +72,34 @@ static bool start_external_player(const char* player, const char* filename, doub
         char start_str[32];
         snprintf(start_str, sizeof(start_str), "%.2f", start_time);
         
+        char volume_str[32];
+        snprintf(volume_str, sizeof(volume_str), "%.0f", safe_volume * 100);
+        
         if (strcmp(player, "ffplay") == 0) {
+            // ffplay: используем фильтр volume для снижения громкости
+            char afilter[64];
+            snprintf(afilter, sizeof(afilter), "volume=%.2f", safe_volume);
             execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
-                   "-ss", start_str, filename, NULL);
+                   "-af", afilter, "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "mpv") == 0) {
+            // mpv: ограничиваем громкость и используем мягкий лимитер
             execlp("mpv", "mpv", "--no-video", "--no-terminal", "--quiet",
+                   "--volume", volume_str,
+                   "--audio-client-name=ascii_player",
+                   "--audio-buffer=0.2",  // Маленький буфер для синхронизации
+                   "--audio-exclusive=no",
                    "--start", start_str, filename, NULL);
         } else if (strcmp(player, "mplayer") == 0) {
+            // mplayer: с ограничением громкости
             execlp("mplayer", "mplayer", "-quiet", "-vo", "null",
+                   "-volume", volume_str, "-softvol", "-softvol-max", "100",
                    "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "vlc") == 0) {
-            execlp("cvlc", "cvlc", "--play-and-exit", "--no-video", 
-                   "--start-time", start_str, filename, NULL);
+            // VLC: ограничение громкости
+            char vlc_volume[32];
+            snprintf(vlc_volume, sizeof(vlc_volume), "%d", (int)(safe_volume * 256));
+            execlp("cvlc", "cvlc", "--play-and-exit", "--no-video",
+                   "--volume", vlc_volume, "--start-time", start_str, filename, NULL);
         }
         
         _exit(1);
@@ -83,6 +107,7 @@ static bool start_external_player(const char* player, const char* filename, doub
         audio_ctx.pid = pid;
         audio_ctx.start_offset = start_time;
         audio_ctx.current_file = filename;
+        audio_ctx.volume = safe_volume;
         clock_gettime(CLOCK_MONOTONIC, &audio_ctx.start_time);
         usleep(200000);
         return true;
@@ -132,6 +157,7 @@ bool audio_init(AudioSystem* audio, const char* filename) {
         else if (strcmp(backend, "vlc") == 0) audio->backend = AUDIO_VLC;
         
         audio->available = true;
+        audio->volume = 0.6f;
         audio->platform_data = strdup(filename);
         return true;
     }
@@ -152,7 +178,7 @@ bool audio_play(AudioSystem* audio, const char* filename, double start_time) {
         default: return false;
     }
     
-    if (start_external_player(player_name, filename, start_time)) {
+    if (start_external_player(player_name, filename, start_time, audio->volume)) {
         audio->playing = true;
         audio->current_time = start_time;
         return true;
@@ -195,6 +221,25 @@ double audio_get_time(AudioSystem* audio) {
     return audio->current_time;
 }
 
+void audio_set_volume(AudioSystem* audio, float volume) {
+    if (!audio) return;
+    
+    if (volume < 0.3f) volume = 0.3f;
+    if (volume > 1.0f) volume = 1.0f;
+    
+    audio->volume = volume;
+    
+    if (audio->playing && audio->platform_data) {
+        double current_time = audio_get_time(audio);
+        audio_stop(audio);
+        audio_play(audio, (const char*)audio->platform_data, current_time);
+    }
+}
+
+float audio_get_volume(AudioSystem* audio) {
+    return audio ? audio->volume : 0.6f;
+}
+
 void audio_cleanup(AudioSystem* audio) {
     audio_stop(audio);
     if (audio->platform_data) {
@@ -218,6 +263,8 @@ bool init_audio(AudioState* audio, const char* filename) {
     
     if (audio_init(audio->system, filename)) {
         audio->initialized = true;
+        audio->volume = 0.6f;  // 60% громкости
+        audio->system->volume = 0.6f;
         return true;
     }
     
@@ -243,6 +290,7 @@ void start_audio(AudioState* audio) {
     if (!audio->playing) {
         AudioSystem* sys = audio->system;
         if (sys->platform_data) {
+            sys->volume = audio->volume;  // Передаём текущую громкость
             if (audio_play(sys, (const char*)sys->platform_data, audio->current_time)) {
                 audio->playing = true;
             }
@@ -279,4 +327,16 @@ void toggle_audio(AudioState* audio) {
     } else {
         start_audio(audio);
     }
+}
+
+void set_audio_volume(AudioState* audio, float volume) {
+    if (!audio || !audio->initialized || !audio->system) return;
+    
+    audio->volume = volume;
+    audio_set_volume(audio->system, volume);
+}
+
+float get_audio_volume(AudioState* audio) {
+    if (!audio || !audio->initialized || !audio->system) return 0.6f;
+    return audio->volume;
 }

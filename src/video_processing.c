@@ -305,14 +305,19 @@ void process_video(const char* filename, AppState* state) {
     
     printf("First video PTS: %.3f seconds\n", first_video_pts);
     
-    // Запускаем аудио с правильной синхронизацией
+    // Запускаем аудио с правильной синхронизацией и громкостью
     if (video.audio_state.initialized && state->audio_enabled) {
         printf("Starting audio with delay: %.3f seconds\n", first_video_pts);
+        printf("Audio volume: %.0f%% (use [ and ] to adjust)\n", state->audio_volume * 100);
+        
+        // Устанавливаем громкость перед запуском
+        set_audio_volume(&video.audio_state, state->audio_volume);
+        
         // Запускаем аудио с задержкой равной PTS первого видео кадра
         if (audio_play(video.audio_state.system, filename, first_video_pts)) {
             video.audio_state.playing = true;
             state->audio_playing = true;
-            printf("Audio started successfully\n");
+            printf("Audio started successfully at %.0f%% volume\n", state->audio_volume * 100);
         } else {
             printf("Failed to start audio\n");
         }
@@ -328,6 +333,8 @@ void process_video(const char* filename, AppState* state) {
     printf("  SPACE - pause/resume\n");
     printf("  M - toggle audio\n");
     printf("  R - reset sync\n");
+    printf("  [ - decrease volume\n");
+    printf("  ] - increase volume\n");
     printf("  > - increase speed\n");
     printf("  < - decrease speed\n");
     printf("  ESC - exit\n");
@@ -421,7 +428,7 @@ void process_video(const char* filename, AppState* state) {
                                     sync_indicator = '>';
                                 }
                                 
-                                printf("[%c] Frames: %4d | Video: %6.2fs | Audio: %6.2fs | Diff: %+6.3fs | Delay: %4.0fms | Speed: %.1fx | Skip: %d | Repeat: %d",
+                                printf("[%c] Frames: %4d | Video: %6.2fs | Audio: %6.2fs | Diff: %+6.3fs | Delay: %4.0fms | Speed: %.1fx | Vol: %.0f%% | Skip: %d | Repeat: %d",
                                        sync_indicator,
                                        frames_displayed, 
                                        video_clock, 
@@ -429,6 +436,7 @@ void process_video(const char* filename, AppState* state) {
                                        video_clock - audio_time,
                                        frame_delay * 1000,
                                        (double)state->playback_speed,
+                                       state->audio_volume * 100,
                                        frames_skipped,
                                        frames_repeated);
                                 fflush(stdout);
@@ -445,7 +453,7 @@ void process_video(const char* filename, AppState* state) {
                     
                     if (video.audio_state.initialized && state->audio_playing) {
                         stop_audio(&video.audio_state);
-                        // При перемотке снова запускаем аудио с правильной задержкой
+                        set_audio_volume(&video.audio_state, state->audio_volume);
                         if (audio_play(video.audio_state.system, filename, first_video_pts)) {
                             video.audio_state.playing = true;
                         }
@@ -480,7 +488,6 @@ void process_video(const char* filename, AppState* state) {
                         if (state->pause_video) {
                             stop_audio(&video.audio_state);
                         } else {
-                            // При возобновлении синхронизируем с текущей позиции
                             double current_audio_time = get_audio_time(&video.audio_state);
                             if (current_audio_time > 0) {
                                 av_seek_frame(video.format_ctx, -1, 
@@ -488,6 +495,7 @@ void process_video(const char* filename, AppState* state) {
                                              AVSEEK_FLAG_BACKWARD);
                                 avcodec_flush_buffers(video.video_codec_ctx);
                             }
+                            set_audio_volume(&video.audio_state, state->audio_volume);
                             start_audio(&video.audio_state);
                             last_frame_time = get_current_time();
                             next_frame_time = last_frame_time;
@@ -502,10 +510,28 @@ void process_video(const char* filename, AppState* state) {
                     }
                     break;
                     
+                case '[': case '{':
+                    // Уменьшить громкость
+                    state->audio_volume = fmax(0.3f, state->audio_volume - 0.05f);
+                    set_audio_volume(&video.audio_state, state->audio_volume);
+                    printf("\n🔉 Volume decreased to %.0f%%", state->audio_volume * 100);
+                    fflush(stdout);
+                    break;
+                    
+                case ']': case '}':
+                    // Увеличить громкость
+                    state->audio_volume = fmin(1.0f, state->audio_volume + 0.05f);
+                    set_audio_volume(&video.audio_state, state->audio_volume);
+                    printf("\n🔊 Volume increased to %.0f%%", state->audio_volume * 100);
+                    fflush(stdout);
+                    break;
+                    
                 case 'r': case 'R':
                     printf("\n=== Resetting sync ===\n");
                     if (video.audio_state.initialized) {
                         stop_audio(&video.audio_state);
+                        // Устанавливаем громкость перед перезапуском
+                        set_audio_volume(&video.audio_state, state->audio_volume);
                         // Запускаем аудио с правильной задержкой
                         if (audio_play(video.audio_state.system, filename, first_video_pts)) {
                             video.audio_state.playing = true;

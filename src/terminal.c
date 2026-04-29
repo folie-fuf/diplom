@@ -66,6 +66,9 @@ void print_help(void) {
     printf("  I      - Toggle info display\n");
     printf("  B      - Toggle border\n");
     printf("  N      - Invert colors\n");
+    printf("\nAudio Controls:\n");
+    printf("  [      - Decrease volume\n");
+    printf("  ]      - Increase volume\n");
     printf("\nVideo Controls:\n");
     printf("  SPACE  - Play/Pause video\n");
     printf("  >      - Increase playback speed\n");
@@ -172,6 +175,27 @@ void handle_user_input(AppState* state, int* original_width, int* original_heigh
             
         case 'm': case 'M':
             state->audio_enabled = !state->audio_enabled;
+            break;
+            
+        // НОВЫЕ КЛАВИШИ ДЛЯ ГРОМКОСТИ (используем [ и ] или , и .)
+        case '[': case '{':
+            // Уменьшить громкость
+            state->audio_volume = fmax(0.3f, state->audio_volume - 0.05f);
+            printf("\033[%d;1H\033[K🔉 Volume: %.0f%% (use [ to decrease, ] to increase)\033[%d;1H", 
+                   state->target_height + 2, state->audio_volume * 100,
+                   state->target_height + 1);
+            fflush(stdout);
+            state->first_frame = true;
+            break;
+            
+        case ']': case '}':
+            // Увеличить громкость
+            state->audio_volume = fmin(1.0f, state->audio_volume + 0.05f);
+            printf("\033[%d;1H\033[K🔊 Volume: %.0f%% (use [ to decrease, ] to increase)\033[%d;1H", 
+                   state->target_height + 2, state->audio_volume * 100,
+                   state->target_height + 1);
+            fflush(stdout);
+            state->first_frame = true;
             break;
     }
     

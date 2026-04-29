@@ -38,6 +38,8 @@ int main(int argc, char *argv[]) {
     state.audio_enabled = true;
     state.first_frame = true;
     state.audio_playing = false;
+
+    state.audio_volume = 0.6f;  // 60% громкости по умолчанию (безопасно)
     
     strncpy(state.current_filename, argv[1], MAX_PATH_LENGTH - 1);
     state.current_filename[MAX_PATH_LENGTH - 1] = '\0';

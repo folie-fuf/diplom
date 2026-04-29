@@ -18,6 +18,7 @@ typedef struct AudioSystem {
     bool playing;
     bool available;
     double current_time;
+    float volume;           // 0.0 - 1.0, по умолчанию 0.6 (60%)
     void* platform_data;
 } AudioSystem;
 
@@ -25,6 +26,7 @@ typedef struct AudioState {
     bool initialized;
     bool playing;
     double current_time;
+    float volume;           // для управления громкостью
     AudioSystem* system;
 } AudioState;
 
@@ -34,6 +36,8 @@ void audio_stop(AudioSystem* audio);
 double audio_get_time(AudioSystem* audio);
 bool audio_has_stream(const char* filename);
 void audio_cleanup(AudioSystem* audio);
+void audio_set_volume(AudioSystem* audio, float volume);
+float audio_get_volume(AudioSystem* audio);             
 
 bool has_audio_stream(const char* filename);
 bool init_audio(AudioState* audio, const char* filename);
@@ -42,5 +46,7 @@ void start_audio(AudioState* audio);
 void stop_audio(AudioState* audio);
 double get_audio_time(AudioState* audio);
 void toggle_audio(AudioState* audio);
+void set_audio_volume(AudioState* audio, float volume); 
+float get_audio_volume(AudioState* audio);              
 
 #endif

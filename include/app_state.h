@@ -54,6 +54,7 @@ typedef struct {
     bool first_frame;
     
     bool audio_playing;
+    float audio_volume;
 } AppState;
 
 #endif
