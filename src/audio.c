@@ -50,12 +50,11 @@ static void remove_audio_pid(pid_t pid) {
 
 // Убиваем все аудио процессы
 void audio_kill_all(void) {
-    // Убиваем текущий процесс в контексте
+    // Убиваем текущий процесс
     if (audio_ctx.pid > 0) {
-        // Убиваем всю группу процессов
-        kill(-audio_ctx.pid, SIGTERM);
-        usleep(50000);
-        kill(-audio_ctx.pid, SIGKILL);
+        kill(audio_ctx.pid, SIGTERM);
+        usleep(100000);
+        kill(audio_ctx.pid, SIGKILL);
         waitpid(audio_ctx.pid, NULL, WNOHANG);
         remove_audio_pid(audio_ctx.pid);
         audio_ctx.pid = 0;
@@ -64,31 +63,13 @@ void audio_kill_all(void) {
     // Убиваем все остальные аудио процессы
     for (int i = 0; i < active_audio_count; i++) {
         if (active_audio_pids[i] > 0) {
-            kill(-active_audio_pids[i], SIGTERM);
-            usleep(50000);
-            kill(-active_audio_pids[i], SIGKILL);
+            kill(active_audio_pids[i], SIGTERM);
+            usleep(100000);
+            kill(active_audio_pids[i], SIGKILL);
             waitpid(active_audio_pids[i], NULL, WNOHANG);
         }
     }
     active_audio_count = 0;
-}
-
-// Обработчик сигнала для очистки
-static void audio_cleanup_handler(int sig) {
-    (void)sig;
-    audio_kill_all();
-    _exit(0);
-}
-
-// Регистрируем обработчики сигналов
-static void register_audio_cleanup(void) {
-    static int registered = 0;
-    if (!registered) {
-        signal(SIGTERM, audio_cleanup_handler);
-        signal(SIGINT, audio_cleanup_handler);
-        signal(SIGHUP, audio_cleanup_handler);
-        registered = 1;
-    }
 }
 
 static bool check_audio_player(const char* player) {
@@ -117,9 +98,9 @@ static const char* select_audio_backend_cached(void) {
 static bool start_external_player(const char* player, const char* filename, double start_time, float volume) {
     // Останавливаем предыдущий аудио процесс
     if (audio_ctx.pid > 0) {
-        kill(-audio_ctx.pid, SIGTERM);
-        usleep(50000);
-        kill(-audio_ctx.pid, SIGKILL);
+        kill(audio_ctx.pid, SIGTERM);
+        usleep(100000);
+        kill(audio_ctx.pid, SIGKILL);
         waitpid(audio_ctx.pid, NULL, WNOHANG);
         remove_audio_pid(audio_ctx.pid);
         audio_ctx.pid = 0;
@@ -132,13 +113,12 @@ static bool start_external_player(const char* player, const char* filename, doub
     
     pid_t pid = fork();
     if (pid == 0) {
-        // Устанавливаем себя как лидера сессии
-        setsid();
+        // НЕ вызываем setsid() - процесс привязан к родителю
+        // При закрытии терминала процесс получит сигнал и умрет
         
-        // Игнорируем сигналы, которые могут прийти от родителя
-        signal(SIGTERM, SIG_DFL);
-        signal(SIGINT, SIG_DFL);
-        signal(SIGHUP, SIG_DFL);
+        // Игнорируем SIGHUP (чтобы не умереть раньше времени), 
+        // но SIGTERM/SIGINT дойдут при закрытии терминала
+        signal(SIGHUP, SIG_IGN);
         
         // Перенаправляем stdout/stderr в /dev/null
         int devnull = open("/dev/null", O_WRONLY);
@@ -185,12 +165,7 @@ static bool start_external_player(const char* player, const char* filename, doub
         audio_ctx.volume = safe_volume;
         clock_gettime(CLOCK_MONOTONIC, &audio_ctx.start_time);
         
-        // Добавляем PID в список активных
         add_audio_pid(pid);
-        
-        // Регистрируем обработчики сигналов
-        register_audio_cleanup();
-        
         usleep(200000);
         return true;
     }
@@ -272,7 +247,15 @@ bool audio_play(AudioSystem* audio, const char* filename, double start_time) {
 void audio_stop(AudioSystem* audio) {
     if (!audio->playing) return;
     
-    audio_kill_all();
+    if (audio_ctx.pid > 0) {
+        kill(audio_ctx.pid, SIGTERM);
+        usleep(100000);
+        kill(audio_ctx.pid, SIGKILL);
+        waitpid(audio_ctx.pid, NULL, WNOHANG);
+        remove_audio_pid(audio_ctx.pid);
+        audio_ctx.pid = 0;
+    }
+    
     audio->playing = false;
     audio->current_time = 0;
 }
