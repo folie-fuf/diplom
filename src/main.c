@@ -3,13 +3,30 @@
 #include "../include/display.h"
 #include "../include/image_processing.h"
 #include "../include/video_processing.h"
-#include "../include/utils.h"
+#include "../include/audio.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
+
+static void emergency_cleanup(void) {
+    audio_kill_all();
+}
+
+static void signal_handler(int sig) {
+    (void)sig;
+    emergency_cleanup();
+    exit(0);
+}
 
 int main(int argc, char *argv[]) {
+    signal(SIGTERM, signal_handler);
+    signal(SIGINT, signal_handler);
+    signal(SIGHUP, signal_handler);
+    
+    atexit(emergency_cleanup);
+    
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <image/video> [-d] [-c] [-b] [-m]\n", argv[0]);
         fprintf(stderr, "Options:\n");
@@ -20,10 +37,8 @@ int main(int argc, char *argv[]) {
         return EXIT_FAILURE;
     }
 
-    // Инициализация с нулями
     AppState state = {0};
     
-    // Базовые настройки
     state.scale_factor = 1.0f;
     state.color_mode = true;
     state.show_info = true;
@@ -38,8 +53,7 @@ int main(int argc, char *argv[]) {
     state.audio_enabled = true;
     state.first_frame = true;
     state.audio_playing = false;
-
-    state.audio_volume = 0.6f;  // 60% громкости по умолчанию (безопасно)
+    state.audio_volume = 0.6f;
     
     strncpy(state.current_filename, argv[1], MAX_PATH_LENGTH - 1);
     state.current_filename[MAX_PATH_LENGTH - 1] = '\0';
@@ -72,6 +86,8 @@ int main(int argc, char *argv[]) {
 
     restore_terminal(&state);
     free_frame_buffers(&state);
+    
+    emergency_cleanup();
     
     return EXIT_SUCCESS;
 }

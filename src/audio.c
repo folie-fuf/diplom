@@ -10,17 +10,86 @@
 #include <fcntl.h>
 #include <stdio.h>
 #include <math.h>
+#include <errno.h>
 
 typedef struct {
     pid_t pid;
     struct timespec start_time;
     double start_offset;
     const char* current_file;
-    float volume;  //хранение громкости
+    float volume;
 } AudioContext;
 
 static AudioContext audio_ctx = {0};
 static const char* cached_audio_backend = NULL;
+
+// Глобальная переменная для хранения всех активных PID
+#define MAX_AUDIO_PROCS 16
+static pid_t active_audio_pids[MAX_AUDIO_PROCS] = {0};
+static int active_audio_count = 0;
+
+// Добавляем PID в список
+static void add_audio_pid(pid_t pid) {
+    if (active_audio_count < MAX_AUDIO_PROCS) {
+        active_audio_pids[active_audio_count++] = pid;
+    }
+}
+
+// Удаляем PID из списка
+static void remove_audio_pid(pid_t pid) {
+    for (int i = 0; i < active_audio_count; i++) {
+        if (active_audio_pids[i] == pid) {
+            for (int j = i; j < active_audio_count - 1; j++) {
+                active_audio_pids[j] = active_audio_pids[j + 1];
+            }
+            active_audio_count--;
+            break;
+        }
+    }
+}
+
+// Убиваем все аудио процессы
+void audio_kill_all(void) {
+    // Убиваем текущий процесс в контексте
+    if (audio_ctx.pid > 0) {
+        // Убиваем всю группу процессов
+        kill(-audio_ctx.pid, SIGTERM);
+        usleep(50000);
+        kill(-audio_ctx.pid, SIGKILL);
+        waitpid(audio_ctx.pid, NULL, WNOHANG);
+        remove_audio_pid(audio_ctx.pid);
+        audio_ctx.pid = 0;
+    }
+    
+    // Убиваем все остальные аудио процессы
+    for (int i = 0; i < active_audio_count; i++) {
+        if (active_audio_pids[i] > 0) {
+            kill(-active_audio_pids[i], SIGTERM);
+            usleep(50000);
+            kill(-active_audio_pids[i], SIGKILL);
+            waitpid(active_audio_pids[i], NULL, WNOHANG);
+        }
+    }
+    active_audio_count = 0;
+}
+
+// Обработчик сигнала для очистки
+static void audio_cleanup_handler(int sig) {
+    (void)sig;
+    audio_kill_all();
+    _exit(0);
+}
+
+// Регистрируем обработчики сигналов
+static void register_audio_cleanup(void) {
+    static int registered = 0;
+    if (!registered) {
+        signal(SIGTERM, audio_cleanup_handler);
+        signal(SIGINT, audio_cleanup_handler);
+        signal(SIGHUP, audio_cleanup_handler);
+        registered = 1;
+    }
+}
 
 static bool check_audio_player(const char* player) {
     char cmd[256];
@@ -46,22 +115,32 @@ static const char* select_audio_backend_cached(void) {
 }
 
 static bool start_external_player(const char* player, const char* filename, double start_time, float volume) {
+    // Останавливаем предыдущий аудио процесс
     if (audio_ctx.pid > 0) {
         kill(-audio_ctx.pid, SIGTERM);
-        waitpid(audio_ctx.pid, NULL, 0);
+        usleep(50000);
+        kill(-audio_ctx.pid, SIGKILL);
+        waitpid(audio_ctx.pid, NULL, WNOHANG);
+        remove_audio_pid(audio_ctx.pid);
         audio_ctx.pid = 0;
     }
     
-    // Ограничиваем громкость разумными пределами (30% - 100%)
     float safe_volume = fmax(0.3, fmin(1.0, volume));
     if (volume > 0.7) {
-        safe_volume = 0.7;  // Принудительное ограничение для устранения треска
+        safe_volume = 0.7;
     }
     
     pid_t pid = fork();
     if (pid == 0) {
+        // Устанавливаем себя как лидера сессии
         setsid();
         
+        // Игнорируем сигналы, которые могут прийти от родителя
+        signal(SIGTERM, SIG_DFL);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGHUP, SIG_DFL);
+        
+        // Перенаправляем stdout/stderr в /dev/null
         int devnull = open("/dev/null", O_WRONLY);
         if (devnull != -1) {
             dup2(devnull, STDOUT_FILENO);
@@ -76,26 +155,22 @@ static bool start_external_player(const char* player, const char* filename, doub
         snprintf(volume_str, sizeof(volume_str), "%.0f", safe_volume * 100);
         
         if (strcmp(player, "ffplay") == 0) {
-            // ffplay: используем фильтр volume для снижения громкости
             char afilter[64];
             snprintf(afilter, sizeof(afilter), "volume=%.2f", safe_volume);
             execlp("ffplay", "ffplay", "-nodisp", "-autoexit", "-loglevel", "quiet",
                    "-af", afilter, "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "mpv") == 0) {
-            // mpv: ограничиваем громкость и используем мягкий лимитер
             execlp("mpv", "mpv", "--no-video", "--no-terminal", "--quiet",
                    "--volume", volume_str,
                    "--audio-client-name=ascii_player",
-                   "--audio-buffer=0.2",  // Маленький буфер для синхронизации
+                   "--audio-buffer=0.2",
                    "--audio-exclusive=no",
                    "--start", start_str, filename, NULL);
         } else if (strcmp(player, "mplayer") == 0) {
-            // mplayer: с ограничением громкости
             execlp("mplayer", "mplayer", "-quiet", "-vo", "null",
                    "-volume", volume_str, "-softvol", "-softvol-max", "100",
                    "-ss", start_str, filename, NULL);
         } else if (strcmp(player, "vlc") == 0) {
-            // VLC: ограничение громкости
             char vlc_volume[32];
             snprintf(vlc_volume, sizeof(vlc_volume), "%d", (int)(safe_volume * 256));
             execlp("cvlc", "cvlc", "--play-and-exit", "--no-video",
@@ -109,6 +184,13 @@ static bool start_external_player(const char* player, const char* filename, doub
         audio_ctx.current_file = filename;
         audio_ctx.volume = safe_volume;
         clock_gettime(CLOCK_MONOTONIC, &audio_ctx.start_time);
+        
+        // Добавляем PID в список активных
+        add_audio_pid(pid);
+        
+        // Регистрируем обработчики сигналов
+        register_audio_cleanup();
+        
         usleep(200000);
         return true;
     }
@@ -190,13 +272,9 @@ bool audio_play(AudioSystem* audio, const char* filename, double start_time) {
 void audio_stop(AudioSystem* audio) {
     if (!audio->playing) return;
     
-    if (audio_ctx.pid > 0) {
-        kill(-audio_ctx.pid, SIGTERM);
-        waitpid(audio_ctx.pid, NULL, 0);
-        audio_ctx.pid = 0;
-    }
-    
+    audio_kill_all();
     audio->playing = false;
+    audio->current_time = 0;
 }
 
 double audio_get_time(AudioSystem* audio) {
@@ -207,6 +285,7 @@ double audio_get_time(AudioSystem* audio) {
     int status;
     if (waitpid(audio_ctx.pid, &status, WNOHANG) != 0) {
         audio->playing = false;
+        remove_audio_pid(audio_ctx.pid);
         audio_ctx.pid = 0;
         return audio->current_time;
     }
@@ -263,7 +342,7 @@ bool init_audio(AudioState* audio, const char* filename) {
     
     if (audio_init(audio->system, filename)) {
         audio->initialized = true;
-        audio->volume = 0.6f;  // 60% громкости
+        audio->volume = 0.6f;
         audio->system->volume = 0.6f;
         return true;
     }
@@ -290,7 +369,7 @@ void start_audio(AudioState* audio) {
     if (!audio->playing) {
         AudioSystem* sys = audio->system;
         if (sys->platform_data) {
-            sys->volume = audio->volume;  // Передаём текущую громкость
+            sys->volume = audio->volume;
             if (audio_play(sys, (const char*)sys->platform_data, audio->current_time)) {
                 audio->playing = true;
             }

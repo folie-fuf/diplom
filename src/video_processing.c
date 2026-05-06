@@ -344,15 +344,19 @@ void process_video(const char* filename, AppState* state) {
     AVPacket packet;
     int frames_skipped = 0;
     int frames_repeated = 0;
+    int last_width = video.video_codec_ctx->width;
+    int last_height = video.video_codec_ctx->height;
     
     while (keep_running) {
+        // Проверяем изменение размера терминала
+        check_terminal_resize(state, &last_width, &last_height);
+        
         if (state->pause_video) {
             if (video.audio_state.initialized && video.audio_state.playing) {
                 stop_audio(&video.audio_state);
             }
             precise_usleep(100000);
-            handle_user_input(state, &video.video_codec_ctx->width, 
-                            &video.video_codec_ctx->height);
+            handle_user_input(state, &last_width, &last_height);
             continue;
         }
         
@@ -428,7 +432,12 @@ void process_video(const char* filename, AppState* state) {
                                     sync_indicator = '>';
                                 }
                                 
-                                printf("[%c] Frames: %4d | Video: %6.2fs | Audio: %6.2fs | Diff: %+6.3fs | Delay: %4.0fms | Speed: %.1fx | Vol: %.0f%% | Skip: %d | Repeat: %d",
+                                // Используем state->target_height для правильного позиционирования информации
+                                int info_line = state->target_height + 1;
+                                if (info_line < 1) info_line = 1;
+                                
+                                printf("\033[%d;1H\033[K[%c] Frames: %4d | Video: %6.2fs | Audio: %6.2fs | Diff: %+6.3fs | Delay: %4.0fms | Speed: %.1fx | Vol: %.0f%% | Skip: %d | Repeat: %d",
+                                       info_line,
                                        sync_indicator,
                                        frames_displayed, 
                                        video_clock, 
@@ -447,7 +456,12 @@ void process_video(const char* filename, AppState* state) {
                 av_packet_unref(&packet);
             } else {
                 if (ret == AVERROR_EOF) {
-                    printf("\n=== End of video, looping ===\n");
+                    // Сохраняем позицию для информации
+                    int info_line = state->target_height + 1;
+                    if (info_line < 1) info_line = 1;
+                    printf("\033[%d;1H\033[K=== End of video, looping ===\n", info_line);
+                    fflush(stdout);
+                    
                     av_seek_frame(video.format_ctx, -1, 0, AVSEEK_FLAG_BACKWARD);
                     avcodec_flush_buffers(video.video_codec_ctx);
                     
@@ -511,28 +525,39 @@ void process_video(const char* filename, AppState* state) {
                     break;
                     
                 case '[': case '{':
-                    // Уменьшить громкость
                     state->audio_volume = fmax(0.3f, state->audio_volume - 0.05f);
                     set_audio_volume(&video.audio_state, state->audio_volume);
-                    printf("\n🔉 Volume decreased to %.0f%%", state->audio_volume * 100);
+                    // Показываем информацию о громкости в правильном месте
+                    int info_line = state->target_height + 2;
+                    if (info_line < 1) info_line = 1;
+                    printf("\033[%d;1H\033[K🔉 Volume decreased to %.0f%%\033[%d;1H", 
+                           info_line, state->audio_volume * 100,
+                           state->target_height + 1);
                     fflush(stdout);
                     break;
                     
                 case ']': case '}':
-                    // Увеличить громкость
                     state->audio_volume = fmin(1.0f, state->audio_volume + 0.05f);
                     set_audio_volume(&video.audio_state, state->audio_volume);
-                    printf("\n🔊 Volume increased to %.0f%%", state->audio_volume * 100);
+                    // Показываем информацию о громкости в правильном месте
+                    int info_line2 = state->target_height + 2;
+                    if (info_line2 < 1) info_line2 = 1;
+                    printf("\033[%d;1H\033[K🔊 Volume increased to %.0f%%\033[%d;1H", 
+                           info_line2, state->audio_volume * 100,
+                           state->target_height + 1);
                     fflush(stdout);
                     break;
                     
                 case 'r': case 'R':
-                    printf("\n=== Resetting sync ===\n");
+                    {
+                        int info_line = state->target_height + 1;
+                        if (info_line < 1) info_line = 1;
+                        printf("\033[%d;1H\033[K=== Resetting sync ===\n", info_line);
+                        fflush(stdout);
+                    }
                     if (video.audio_state.initialized) {
                         stop_audio(&video.audio_state);
-                        // Устанавливаем громкость перед перезапуском
                         set_audio_volume(&video.audio_state, state->audio_volume);
-                        // Запускаем аудио с правильной задержкой
                         if (audio_play(video.audio_state.system, filename, first_video_pts)) {
                             video.audio_state.playing = true;
                         }
@@ -560,8 +585,7 @@ void process_video(const char* filename, AppState* state) {
                     break;
                     
                 default:
-                    handle_user_input(state, &video.video_codec_ctx->width,
-                                    &video.video_codec_ctx->height);
+                    handle_user_input(state, &last_width, &last_height);
                     break;
             }
         }
@@ -570,5 +594,6 @@ void process_video(const char* filename, AppState* state) {
     }
     
     printf("\n\nStopping playback...\n");
+    fflush(stdout);
     close_video(&video);
 }
